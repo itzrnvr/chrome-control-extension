@@ -7,6 +7,9 @@
 //  - Reconnects forever with capped exponential backoff, so a Chrome restart or a
 //    suspended service worker self-heals without anyone touching anything.
 //  - A periodic keepalive over the open socket stops MV3 from idling us out.
+//
+// MV3 forbids eval/new Function in extension contexts, so page work is done with
+// discrete DOM operations (see content.js) rather than caller-supplied strings.
 
 const WS_URL = "ws://127.0.0.1:8765";
 const KEEPALIVE_MS = 20000;
@@ -85,12 +88,27 @@ function send(obj) {
   }
 }
 
+const connected = () => !!(ws && ws.readyState === WebSocket.OPEN);
+
 // ---------------------------------------------------------------- dispatch
+
+async function activeTabId() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab) throw new Error("no active tab");
+  return tab.id;
+}
+
+async function resolveTab(msg) {
+  return msg.tabId != null ? msg.tabId : activeTabId();
+}
 
 async function dispatch(msg) {
   switch (String(msg.cmd || "").toLowerCase()) {
     case "ping":
-      return { pong: true, ts: Date.now() };
+      return { pong: true, ts: Date.now(), connected: connected() };
+
+    case "status":
+      return { connected: connected(), wsState: ws ? ws.readyState : null };
 
     case "list_tabs":
       return (await chrome.tabs.query({})).map((t) => ({
@@ -118,36 +136,27 @@ async function dispatch(msg) {
       await chrome.tabs.remove(msg.tabId);
       return { ok: true };
 
-    case "eval": {
-      let tabId = msg.tabId;
-      if (tabId == null) {
-        const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (!active) throw new Error("no active tab");
-        tabId = active.id;
-      }
-      return await evalIn(tabId, msg.expression, msg.world);
+    // -- DOM operations -------------------------------------------------
+    case "op": {
+      const tabId = await resolveTab(msg);
+      return await op(tabId, msg);
     }
 
     case "wait_for": {
       const deadline = Date.now() + (msg.timeoutMs || 15000);
+      const sel = msg.selector;
       let last = null;
       while (Date.now() < deadline) {
         try {
-          last = await evalIn(msg.tabId, msg.expression, msg.world);
-          if (last) return { matched: true, value: last };
+          last = await op(msg.tabId, { op: "wait", selector: sel });
+          if (last) return { matched: true, tabId: await resolveTab(msg) };
         } catch (e) {
           last = String((e && e.message) || e);
         }
         await new Promise((r) => setTimeout(r, msg.intervalMs || 400));
       }
-      return { matched: false, value: last };
+      return { matched: false, last };
     }
-
-    case "text":
-      return await evalIn(
-        msg.tabId != null ? msg.tabId : (await chrome.tabs.query({ active: true, currentWindow: true }))[0].id,
-        "document.body ? document.body.innerText : ''"
-      );
 
     case "cookies": {
       const out = await chrome.cookies.getAll(msg.domain ? { domain: msg.domain } : {});
@@ -163,24 +172,37 @@ async function dispatch(msg) {
   }
 }
 
-async function evalIn(tabId, expression, world) {
-  if (!expression) throw new Error("missing expression");
+async function op(tabId, msg) {
   try {
     const res = await chrome.tabs.sendMessage(tabId, {
-      __bridge: "eval", expression, world: world || "isolated"
+      __bridge: "op",
+      op: msg.op,
+      selector: msg.selector,
+      name: msg.name,
+      value: msg.value,
+      limit: msg.limit,
+      expression: msg.expression
     });
     if (res && res.ok) return res.value;
     throw new Error((res && res.error) || "content script returned no result");
   } catch (e) {
-    // No content script here (chrome:// pages, PDF viewer, store pages).
-    const [inj] = await chrome.scripting.executeScript({
-      target: { tabId, frameIds: [0] },
-      world: world === "main" ? "MAIN" : "ISOLATED",
-      func: (src) => (0, eval)(src),
-      args: [expression]
-    });
-    if (inj && inj.result !== undefined) return inj.result;
-    throw new Error(String((e && e.message) || e));
+    const err = String((e && e.message) || e);
+    // "Receiving end does not exist" means the content script is not in that
+    // tab yet - usually because the tab was loaded before the extension was
+    // installed or reloaded. That is fixable; a chrome:// URL is not.
+    if (/Receiving end does not exist/i.test(err)) {
+      throw new Error(
+        "no content script in that tab yet. It was probably loaded before the " +
+        "extension was installed or reloaded - reload the tab (Ctrl+R / F5) and retry."
+      );
+    }
+    if (/Cannot access a chrome:\/\/ URL/i.test(err)) {
+      throw new Error(
+        "chrome:// pages, the Chrome Web Store and the PDF viewer cannot be " +
+        "scripted by extensions. Use a normal web page instead."
+      );
+    }
+    throw new Error(err);
   }
 }
 
@@ -189,13 +211,13 @@ async function evalIn(tabId, expression, world) {
 chrome.runtime.onStartup.addListener(connect);
 chrome.runtime.onInstalled.addListener(connect);
 
-// Belt and braces: if the worker is ever evicted, this wakes it up to reconnect.
+// Belt and braces: if the worker is ever evicted, this wakes it to reconnect.
 chrome.alarms.create("keepalive", { periodInMinutes: 0.4 });
 chrome.alarms.onAlarm.addListener(() => connect());
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.__popup === "status") {
-    sendResponse({ connected: !!(ws && ws.readyState === WebSocket.OPEN) });
+    sendResponse({ connected: connected() });
     return false;
   }
   if (msg && msg.__popup === "reconnect") {
