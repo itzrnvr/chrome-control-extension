@@ -4,8 +4,9 @@ Chrome Control - local bridge.
 
 Two modes in one file:
 
-  serve    Listen on 127.0.0.1:8765 for the Chrome Control extension.
-           Run this and leave it running; the extension reconnects on its own.
+  serve    Listen on 127.0.0.1:8765. The extension connects here and holds one
+           long-lived socket; CLI clients connect, send one command, and get the
+           extension's reply relayed back.
 
   <cmd>    Send one command to the extension and print the JSON result.
 
@@ -38,27 +39,129 @@ WS_URI = f"ws://{HOST}:{PORT}"
 MAX_MSG = 32 * 1024 * 1024
 
 
-# ------------------------------------------------------------------ server
+class Hub:
+    """Holds the one live extension socket plus in-flight command futures."""
 
-async def serve(host: str, port: int) -> None:
-    async with websockets.serve(_on_client, host, port, max_size=MAX_MSG):
-        print(f"chrome-control bridge listening on ws://{host}:{port}", flush=True)
-        print("waiting for the Chrome Control extension to connect...", flush=True)
-        await asyncio.Future()
+    def __init__(self) -> None:
+        self.extension = None
+        self.pending: dict[int, asyncio.Future] = {}
+        self._ready = asyncio.Event()
 
+    # -- extension side -------------------------------------------------
 
-async def _on_client(ws) -> None:
-    print("extension connected", flush=True)
-    try:
-        async for raw in ws:
+    async def attach(self, ws) -> None:
+        if self.extension is not None and self.extension is not ws:
+            try:
+                await self.extension.close()
+            except Exception:
+                pass
+        self.extension = ws
+        self._ready.set()
+        print("extension attached", flush=True)
+
+        try:
+            async for raw in ws:
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+                mid = msg.get("id")
+                if mid is None:
+                    continue
+                fut = self.pending.pop(mid, None)
+                if fut is not None and not fut.done():
+                    fut.set_result(msg)
+        except Exception as exc:
+            print(f"extension link ended: {exc}", flush=True)
+        finally:
+            if self.extension is ws:
+                self.extension = None
+                self._ready.clear()
+            for fut in list(self.pending.values()):
+                if not fut.done():
+                    fut.set_exception(ConnectionError("extension disconnected"))
+            self.pending.clear()
+
+    # -- CLI side -------------------------------------------------------
+
+    async def handle_client(self, ws, first: str) -> None:
+        loop = asyncio.get_event_loop()
+        raw = first
+        while True:
             try:
                 msg = json.loads(raw)
             except Exception:
-                continue
-            if msg.get("event") == "hello":
-                print(f"hello from extension v{msg.get('version')}", flush=True)
-    except Exception as exc:
-        print(f"extension disconnected: {exc}", flush=True)
+                msg = None
+
+            # A CLI client sends a command object with an id.
+            if isinstance(msg, dict) and msg.get("id") is not None:
+                await self._relay(ws, raw, msg, loop)
+
+            try:
+                raw = await ws.recv()
+            except Exception:
+                return
+
+    async def _relay(self, ws, raw: str, msg: dict, loop) -> None:
+        # Make sure an extension is attached before we forward.
+        try:
+            await asyncio.wait_for(self._ready.wait(), timeout=10)
+        except asyncio.TimeoutError:
+            await ws.send(json.dumps({"id": msg["id"], "ok": False,
+                                     "error": "extension not connected"}))
+            return
+
+        ext = self.extension
+        if ext is None:
+            await ws.send(json.dumps({"id": msg["id"], "ok": False,
+                                     "error": "extension not connected"}))
+            return
+
+        fut = loop.create_future()
+        self.pending[msg["id"]] = fut
+        try:
+            await ext.send(raw)
+            reply = await asyncio.wait_for(fut, timeout=60)
+        except asyncio.TimeoutError:
+            self.pending.pop(msg["id"], None)
+            reply = {"id": msg["id"], "ok": False,
+                     "error": "extension did not respond in time"}
+        except Exception as exc:
+            self.pending.pop(msg["id"], None)
+            reply = {"id": msg["id"], "ok": False, "error": str(exc)}
+
+        try:
+            await ws.send(json.dumps(reply))
+        except Exception:
+            pass
+
+
+HUB = Hub()
+
+
+async def serve(host: str, port: int) -> None:
+    async def handler(ws) -> None:
+        # The extension always greets first with an event message; a CLI client
+        # sends a command with an id. That first message tells us which it is.
+        try:
+            first = await asyncio.wait_for(ws.recv(), timeout=15)
+        except Exception:
+            return
+        try:
+            msg = json.loads(first)
+        except Exception:
+            return
+
+        if isinstance(msg, dict) and msg.get("event") == "hello":
+            print(f"hello from extension v{msg.get('version')}", flush=True)
+            await HUB.attach(ws)
+        else:
+            await HUB.handle_client(ws, first)
+
+    async with websockets.serve(handler, host, port, max_size=MAX_MSG):
+        print(f"chrome-control bridge listening on ws://{host}:{port}", flush=True)
+        print("waiting for the Chrome Control extension...", flush=True)
+        await asyncio.Future()
 
 
 # ------------------------------------------------------------------ client
@@ -92,7 +195,8 @@ def build_payload(args) -> dict:
     if cmd == "nav":
         return {"id": nid, "cmd": "navigate", "url": args.arg, "tabId": args.tab}
     if cmd == "go":
-        return {"id": nid, "cmd": "eval", "tabId": args.tab, "expression": args.arg, "world": args.world}
+        return {"id": nid, "cmd": "eval", "tabId": args.tab,
+                "expression": args.arg, "world": args.world}
     if cmd == "text":
         return {"id": nid, "cmd": "text", "tabId": args.tab}
     if cmd == "activate":
@@ -126,7 +230,7 @@ async def run_client(args) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Chrome Control bridge")
-    sub = parser.add_subparsers(dest="mode")
+    sub = parser.add_subparsers(dest="cmd")
 
     s = sub.add_parser("serve", help="run the bridge server")
     s.add_argument("--host", default=HOST)
@@ -145,7 +249,7 @@ def main() -> int:
         return 2
 
     args = parser.parse_args(argv)
-    if args.mode == "serve":
+    if args.cmd == "serve":
         try:
             asyncio.run(serve(args.host, args.port))
         except KeyboardInterrupt:
