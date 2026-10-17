@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node
+node_modules/
+package-lock.json
+
+# Build / editor
+dist/
+build/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Never commit secrets or captured browser data
+.env
+*.key
+*.pem
+*.sqlite
+*.sqlite3
+*cookies*
+*profile*
+captures/
+traces/

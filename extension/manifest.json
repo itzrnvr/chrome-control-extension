@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Chrome Control",
+  "version": "1.0.0",
+  "description": "Local control bridge. Permissions are granted once at install; there is no per-connection approval. Connects only to 127.0.0.1 on this machine.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "tabs",
+    "cookies",
+    "storage",
+    "scripting",
+    "alarms"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  }
+}

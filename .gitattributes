@@ -1,0 +1,7 @@
+* text=auto eol=lf
+
+# Keep JS/JSON LF regardless of platform
+*.js   text eol=lf
+*.json text eol=lf
+*.py   text eol=lf
+*.md   text eol=lf
